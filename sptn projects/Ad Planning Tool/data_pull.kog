@@ -1,0 +1,374 @@
+
+-- create better formatted anchor group table
+CREATE VIEW anchor_groups AS
+SELECT
+   CAST(UPC AS BIGINT) AS UPC,
+   CAST(anchorid AS INT) AS anchor_id,
+   anchordescription AS anchor_desc
+FROM extra.anchorgroups;
+
+CREATE VIEW IMAGE anchor_groups;
+
+
+-- identify weeks where anchor group was in weekly ad by banner; criteria: >= 85% spend must be tied to promotion_key = 2
+CREATE VIEW weekly_ad AS 
+SELECT 
+    fiscal_week_no,
+    banner_no,
+    anchor_id,
+    SUM(CASE WHEN promotion_key = 2 THEN spend ELSE 0 END) AS ad_spend,
+    SUM(spend) AS spend,
+    SUM(CASE WHEN promotion_key = 2 THEN spend ELSE 0 END) / NULLIF(SUM(CAST(spend AS FLOAT)), 0) AS pct
+FROM 
+    hal.item_fact_spartan a
+INNER JOIN 
+    hal.product_dim_spartan b ON b.product_key = a.product_key
+INNER JOIN
+    hal.calendar_dim_spartan c ON c.date_key = a.date_key
+INNER JOIN 
+    hal.location_dim_spartan d ON d.location_key = a.location_key    
+INNER JOIN 
+    anchor_groups e ON e.upc = b.upc_no    
+WHERE fiscal_week_no >= 201509
+GROUP BY 1, 2, 3
+HAVING  SUM(CASE WHEN promotion_key IN (2) THEN spend ELSE 0 END) / NULLIF(SUM(spend), 0) > 0.85;
+
+CREATE VIEW IMAGE weekly_ad;
+
+
+-- identify weeks where anchor group was in special ad by banner; criteria: >= 85% spend must be tied to promotion_key = 1; only using sales on TH, F, SAT
+CREATE VIEW special_ad AS 
+SELECT 
+    fiscal_week_no,
+    banner_no,
+    anchor_id,
+    SUM(CASE WHEN promotion_key = 1 THEN spend ELSE 0 END) AS ad_spend,
+    SUM(spend) AS spend,
+    SUM(CASE WHEN promotion_key = 1 THEN spend ELSE 0 END) / NULLIF(SUM(CAST(spend AS FLOAT)), 0) AS pct
+FROM 
+    hal.item_fact_spartan a
+INNER JOIN 
+    hal.product_dim_spartan b ON b.product_key = a.product_key
+INNER JOIN
+    hal.calendar_dim_spartan c ON c.date_key = a.date_key
+INNER JOIN 
+    hal.location_dim_spartan d ON d.location_key = a.location_key    
+INNER JOIN 
+    anchor_groups e ON e.upc = b.upc_no    
+WHERE fiscal_week_no >= 201509
+     AND DAYOFWEEK(a.date_key) IN (4, 5, 6) -- TH, F, SAT
+GROUP BY 1, 2, 3
+HAVING  SUM(CASE WHEN promotion_key IN (1) THEN spend ELSE 0 END) / NULLIF(SUM(spend), 0) > 0.85;
+
+CREATE VIEW IMAGE special_ad;
+
+
+-- Combine and and "type" label
+CREATE VIEW ad_weeks AS
+SELECT 
+        fiscal_week_no,
+        banner_no,
+        anchor_id,
+        1 AS ad_type
+FROM weekly_ad
+
+UNION
+
+SELECT 
+        fiscal_week_no,
+        banner_no,
+        anchor_id,
+        2 AS ad_type
+FROM special_ad;       
+
+CREATE VIEW IMAGE ad_weeks;
+
+
+
+
+-- Baseline Code
+
+-- select anchor group UPCs
+CREATE VIEW prod_01 AS
+SELECT
+    a.product_key,
+    b.anchor_id
+FROM 
+    hal.product_dim_spartan a
+INNER JOIN 
+    anchor_groups b ON b.upc = a.upc_no
+WHERE anchor_id = 12309;
+
+CREATE VIEW IMAGE prod_01;
+
+
+--- know week when anchor group is on promotion
+CREATE VIEW time_01 AS
+SELECT date_key
+FROM RPL.DATE_DIM
+WHERE (date_key BETWEEN DATE '2016-01-31' AND DATE '2016-02-06')
+AND X1 = 20; -- Partition filter and access filter
+
+CREATE VIEW IMAGE time_01;
+
+
+-- select stores within banner 
+CREATE VIEW loc_01 AS
+SELECT 
+    banner_no AS LOCATION, 
+    location_key
+FROM 
+    hal.location_dim_spartan 
+WHERE banner_no = 210;
+
+CREATE VIEW IMAGE loc_01;
+
+
+-- all days and weeks with a full 7 days per week
+CREATE VIEW promo_weeks_01 AS
+WITH full_weeks AS (
+SELECT 
+    fiscal_week_no,
+    COUNT(*) AS days
+FROM 
+    hal.calendar_dim_spartan
+GROUP BY 1
+HAVING  COUNT(*) = 7)
+
+SELECT
+    a.date_key, 
+    a.fiscal_week_no
+FROM 
+    hal.calendar_dim_spartan a
+INNER JOIN
+    full_weeks b ON b.fiscal_week_no = a.fiscal_week_no;
+
+CREATE VIEW IMAGE promo_weeks_01;
+
+
+CREATE VIEW promo_bl_summary_01 AS
+SELECT *, 
+    CASE WHEN COALESCE(p_units, 0) > 0 THEN 1 ELSE 0 END AS promo --flag combinations of prod/loc/week on promotion
+FROM (    
+      SELECT 
+          LOCATION, 
+          location_key, 
+          fiscal_week_no, 
+          product_key,
+          SUM(spend) AS tot_spend,
+          SUM(CASE WHEN promo_flg > 0 THEN spend END) AS p_spend,
+          SUM(CASE WHEN promo_flg = 0 THEN spend END) AS np_spend,
+          SUM(CASE WHEN promo_flg = 1 THEN spend END) AS non_foc_p_spend,
+          SUM(CASE WHEN promo_flg = 2 THEN spend END) AS foc_p_spend,
+          SUM(units) AS tot_units,
+          SUM(CASE WHEN promo_flg > 0 THEN units END) AS p_units,
+          SUM(CASE WHEN promo_flg = 0 THEN units END) AS np_units,
+          SUM(CASE WHEN promo_flg = 1 THEN units END) AS non_foc_p_units,
+          SUM(CASE WHEN promo_flg = 2 THEN units END) AS foc_p_units
+      FROM (
+            SELECT 
+                LOCATION, 
+                a.location_key, 
+                d.fiscal_week_no, 
+                a.transaction_key, 
+                a.product_key,
+                MAX(CASE WHEN e.fiscal_week_no IS NOT NULL THEN 2 ELSE 0 END) AS promo_flg, --when promotion not picked.
+                SUM(spend) AS spend,
+                SUM(units) AS units
+            FROM 
+                RPL.ITEM_FACT a
+            INNER JOIN 
+                RPL.CUSTOMER_LOOKUP hh ON a.customer_key = hh.customer_key
+            INNER JOIN 
+                prod_01 b ON a.product_key = b.product_key
+            INNER JOIN 
+                loc_01 c ON a.location_key = c.location_key
+            INNER JOIN 
+                promo_weeks_01 d ON a.date_key = d.date_key
+            LEFT JOIN 
+                ad_weeks e ON e.banner_no = c.LOCATION AND e.anchor_id = b.anchor_id AND e.fiscal_week_no = d.fiscal_week_no
+            WHERE a.X1=20
+            GROUP BY 1, 2, 3, 4, 5) x
+      GROUP BY 1, 2, 3, 4) y;
+
+CREATE VIEW IMAGE promo_bl_summary_01;
+
+
+CREATE VIEW promo_bl_base_01 AS
+SELECT a.LOCATION, a.location_key, a.product_key, b.prom_wc,
+       COALESCE(promo,0) AS promo,
+       COALESCE(tot_spend, 0) AS tot_spend, 
+       COALESCE(p_spend, 0) AS p_spend, 
+       COALESCE(np_spend, 0) AS np_spend,
+       COALESCE(non_foc_p_spend,0) AS non_foc_p_spend,
+       COALESCE(foc_p_spend,0) AS foc_p_spend,
+       COALESCE(tot_units, 0) AS tot_units, 
+       COALESCE(p_units, 0) AS p_units, 
+       COALESCE(np_units, 0) AS np_units,
+       COALESCE(non_foc_p_units,0) AS non_foc_p_units,
+       COALESCE(foc_p_units,0) AS foc_p_units
+FROM (SELECT DISTINCT LOCATION, location_key, product_key FROM promo_bl_summary_01) a
+CROSS JOIN (SELECT DISTINCT prom_wc FROM promo_weeks_01) b
+LEFT JOIN promo_bl_summary_01 d ON a.location_key=d.location_key AND a.product_key=d.product_key AND b.prom_wc=d.prom_wc
+
+
+CREATE VIEW IMAGE promo_bl_base_01
+
+
+CREATE VIEW promo_bl_model_01 AS
+SELECT d.LOCATION, d.prom_wc, CASE WHEN e.prom_wc IS NOT NULL THEN 1 ELSE 0 END AS foc_week,
+       baseline,
+       CASE WHEN e.prom_wc IS NULL THEN tot_units
+            WHEN e.prom_wc IS NOT NULL THEN non_foc_p_units
+            ELSE 0
+       END AS non_focus_units,
+       CASE WHEN e.prom_wc IS NOT NULL THEN np_units ELSE 0 END AS std_price_units,
+       CASE WHEN e.prom_wc IS NOT NULL THEN
+            CASE WHEN (tot_units - non_foc_p_units) >= baseline AND baseline >= np_units THEN baseline - np_units
+                 WHEN (tot_units - non_foc_p_units) < baseline AND baseline >= np_units THEN (tot_units - non_foc_p_units) - np_units
+                 ELSE 0
+            END
+         ELSE 0
+       END AS subsidised_units,
+       CASE WHEN e.prom_wc IS NOT NULL THEN 
+            CASE WHEN baseline >= np_units AND (tot_units - non_foc_p_units) > baseline THEN (tot_units - non_foc_p_units) - baseline
+                 WHEN baseline < np_units AND (tot_units - non_foc_p_units) > np_units THEN (tot_units - non_foc_p_units) - np_units
+                 ELSE 0
+            END 
+         ELSE 0
+       END AS incremental_units 
+FROM (
+      SELECT LOCATION, prom_wc,
+             CAST(SUM(tot_units) AS DECIMAL(18,4)) AS tot_units,
+             CAST(SUM(non_foc_p_units) AS DECIMAL(18,4)) AS non_foc_p_units,
+             CAST(SUM(np_units) AS DECIMAL(18,4)) AS np_units,
+             CAST(SUM(exp_index) AS DECIMAL(18,4)) AS baseline
+      FROM (
+            SELECT LOCATION, prom_wc, tot_units, p_units, np_units, non_foc_p_units,
+                   CAST(CASE WHEN rn <= 0 THEN NULL
+                             WHEN rn = 1 THEN SUM(sales_ind) OVER (PARTITION BY LOCATION, product_key, location_key ORDER BY prom_wc)
+                             WHEN rn = 2 THEN SUM(sales_ind) OVER (PARTITION BY LOCATION, product_key, location_key ORDER BY prom_wc)/2
+                             WHEN rn > 2 THEN SUM(sales_pwr) OVER (PARTITION BY LOCATION, product_key, location_key ORDER BY prom_wc)
+                                              * POWER(2e0/3e0, rn) END AS DECIMAL(18,6)) AS exp_index
+            FROM (
+                  SELECT LOCATION, product_key, location_key, prom_wc, tot_units, p_units, np_units, non_foc_p_units, sales_ind, rn,
+				         CAST(sales_ind AS FLOAT) * POWER(3e0/2e0, rn) * CASE WHEN rn = 1 THEN 1e0 ELSE 1e0/3e0 END AS sales_pwr
+                  FROM (
+                        SELECT LOCATION, product_key, location_key, prom_wc, tot_units, p_units, np_units, non_foc_p_units,
+                               CASE WHEN promo = 0 THEN tot_units END AS sales_ind, --units for weeks when promotion was not running
+                               COUNT(CASE WHEN promo = 0 THEN 1 END) OVER (PARTITION BY LOCATION, product_key, location_key ORDER BY prom_wc) AS rn
+                        FROM promo_bl_base_01
+                       ) a
+                  ) b
+            ) c
+      GROUP BY 1, prom_wc
+      ) d
+LEFT JOIN (
+           SELECT LOCATION, prom_wc 
+           FROM promo_bl_summary_01 
+           GROUP BY 1, prom_wc
+           HAVING SUM(p_spend)>0
+        ) e ON d.prom_wc=e.prom_wc AND d.LOCATION=e.LOCATION
+WHERE d.prom_wc in (SELECT DISTINCT prom_wc FROM time_01 t INNER JOIN promo_weeks_01 pw ON t.date_key=pw.date_key)
+
+
+CREATE VIEW IMAGE promo_bl_model_01
+
+
+SELECT a.LOCATION, TO_CHAR(a.prom_wc,'YYYY-MM-DD') AS WEEK_START, 1 AS DEMOG_VAR, DEMOG_VAL, units AS units, 
+       CASE WHEN DEMOG_VAL IN (4) AND foc_week=1 THEN CAST(units*non_foc_p_ppp AS DECIMAL(18,4))
+            WHEN DEMOG_VAL IN (4) AND foc_week=0 THEN CAST(units*tot_ppp AS DECIMAL(18,4))
+            WHEN DEMOG_VAL IN (2,3) THEN CAST(units*foc_p_ppp AS DECIMAL(18,4))
+            WHEN DEMOG_VAL IN (1) THEN CAST(units*np_ppp AS DECIMAL(18,4))
+	     WHEN DEMOG_VAL IN (5) AND foc_week=1 THEN CAST(foc_baseline_spend AS DECIMAL(18,4))
+            WHEN DEMOG_VAL IN (5) AND foc_week=0 THEN CAST(non_foc_baseline_spend AS DECIMAL(18,4))
+	END AS Spend
+FROM (
+      SELECT prom_wc,
+             LOCATION,
+	      1 AS DEMOG_VAL,      --STANDARD PRICE
+             std_price_units AS units
+      FROM promo_bl_model_01
+      UNION ALL
+      SELECT prom_wc,
+             LOCATION,
+	      2,                   --SUBSIDISED
+             subsidised_units
+      FROM promo_bl_model_01
+      UNION ALL
+      SELECT prom_wc,
+             LOCATION,
+	      3,                   --INCREMENTAL
+             incremental_units
+      FROM promo_bl_model_01
+      UNION ALL
+      SELECT prom_wc,
+             LOCATION,
+	      4,                 --NON-FOCUS
+             non_focus_units
+      FROM promo_bl_model_01
+      UNION ALL
+      SELECT prom_wc,
+             LOCATION, 
+             5,                    --BASELINE
+             baseline
+      FROM promo_bl_model_01
+     ) a
+INNER JOIN 
+    (
+     SELECT in3.*, 
+            baseline*(COALESCE((std_price_units/NULLIF(std_incr_sum,0))*np_ppp,0) + COALESCE((subsidised_units/NULLIF(std_incr_sum,0))*foc_p_ppp,0)) AS foc_baseline_spend,
+            baseline*(FIRST(tot_ppp) OVER (PARTITION BY LOCATION, value_group ORDER BY prom_wc)) AS non_foc_baseline_spend --multiply by most recent non-zero tot_ppp
+     FROM
+         (SELECT in1.*, baseline, std_price_units, subsidised_units, std_incr_sum, 
+                 SUM(CASE WHEN tot_ppp=0 THEN 0 ELSE 1 END) OVER (PARTITION BY in1.LOCATION ORDER BY in1.prom_wc) AS value_group
+          FROM 
+              (SELECT a.LOCATION, a.prom_wc, foc_week,
+                        COALESCE(CAST(SUM(tot_spend) AS FLOAT)/NULLIF(SUM(tot_units),0),0) as tot_ppp,
+                        COALESCE(CAST(SUM(np_spend) AS FLOAT)/NULLIF(SUM(np_units),0),0) as np_ppp,
+                        COALESCE(CAST(SUM(non_foc_p_spend) AS FLOAT)/NULLIF(SUM(non_foc_p_units),0),0) as non_foc_p_ppp,
+                        COALESCE(CAST(SUM(foc_p_spend) AS FLOAT)/NULLIF(SUM(foc_p_units),0),0) as foc_p_ppp
+                 FROM promo_bl_base_01 a INNER JOIN (SELECT DISTINCT LOCATION, prom_wc, foc_week FROM promo_bl_model_01) b ON a.prom_wc=b.prom_wc AND a.LOCATION=b.LOCATION
+                 GROUP BY 1, a.prom_wc, foc_week
+                ) in1
+          INNER JOIN
+              (
+               SELECT LOCATION, prom_wc, baseline, std_price_units, subsidised_units, CAST(std_price_units+subsidised_units AS FLOAT) AS std_incr_sum
+               FROM promo_bl_model_01
+              ) in2
+          ON in1.LOCATION=in2.LOCATION AND in1.prom_wc=in2.prom_wc
+         ) in3
+     ) b
+ON a.LOCATION=b.LOCATION AND a.prom_wc=b.prom_wc
+
+
+DROP VIEW promo_bl_model_01
+
+
+DROP VIEW promo_bl_base_01
+
+
+DROP VIEW promo_bl_summary_01
+
+
+DROP VIEW promo_weeks_01
+
+
+DROP VIEW loc_01
+
+
+DROP VIEW time_01
+
+
+DROP VIEW prod_01
+
+
+
+
+            
+
+
+
+
+
+
